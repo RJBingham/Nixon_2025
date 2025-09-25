@@ -1,0 +1,322 @@
+---
+title: "Computational Framework to Identify Beta Barrels in Borrelia Plasmid Proteome"
+format: html
+---
+
+## Part 1 - downloading the Borrelia plasmid proteome
+
+# Load the libraries
+```{r}
+if (!requireNamespace("Biostrings", quietly = TRUE)) {
+  install.packages("BiocManager")
+  BiocManager::install("Biostrings")
+}
+library(tidyverse)
+library(here)
+library(janitor)
+library(httr)
+library(jsonlite)
+library(Biostrings)
+library(stringr)
+library(readr)
+library(tibble)
+```
+## Getting proteome data from Uniprot
+Proteome information was downloaded from Uniprot https://www.uniprot.org/proteomes?query=borrelia 
+3 Reference proteomes (type 1)
+23 Other proteomes (type 2)
+Total = 26 proteomes 
+
+
+```{r}
+#read in the tsv files
+proteomes <- rbind(
+  read_tsv(here("list_of_borrelia_proteomes","proteomes_borrelia_AND_proteome_type_1_2025_06_16.tsv")),
+  read_tsv(here("list_of_borrelia_proteomes","proteomes_borrelia_AND_proteome_type_2_2025_06_16.tsv"))
+)
+proteome_ids <- proteomes |> pull(`Proteome Id`)
+proteome_ids
+```
+
+## Download individual components of all target proteomes (both plasmids and chromosomes)
+
+```{r}
+# Define base URL
+base_url <- "https://rest.uniprot.org"
+
+# Output directories and files
+output_dir <- here("uniprot_component_fasta_files")
+summary_file <- here("uniprot_component_fasta_files", "download_summary.csv")
+if (!dir.exists(output_dir)) dir.create(output_dir)
+
+# Function to get components for a given proteome ID
+get_components <- function(proteome_id) {
+  url <- paste0(base_url, "/proteomes/", proteome_id, "?format=json")
+  response <- GET(url)
+  if (http_error(response)) {
+    warning("Failed to retrieve components for: ", proteome_id)
+    return(NULL)
+  }
+  data <- fromJSON(content(response, as = "text", encoding = "UTF-8"))
+  if (!"components" %in% names(data)) return(NULL)
+  return(data$components$name)
+}
+
+# Function to build UniProtKB FASTA URL for a proteome component
+build_fasta_url <- function(proteome_id, component_name) {
+  query <- paste0(
+    "(proteome:", proteome_id, " AND proteomecomponent:\"",
+    component_name, "\")"
+  )
+  url <- paste0(
+    base_url,
+    "/uniprotkb/stream?format=fasta&query=",
+    URLencode(query, reserved = TRUE)
+  )
+  return(url)
+}
+
+# Function to download a file to specified path
+download_fasta_file <- function(url, file_path) {
+  response <- GET(url, write_disk(file_path, overwrite = TRUE), timeout(120))
+  if (http_error(response)) {
+    warning("Failed to download: ", url)
+    return(FALSE)
+  }
+  if (file.size(file_path) == 0) {
+    file.remove(file_path)
+    warning("Downloaded file was empty: ", url)
+    return(FALSE)
+  }
+  return(TRUE)
+}
+
+# Initialize summary data frame
+summary_log <- tibble(
+  proteome_id = character(),
+  component_name = character(),
+  fasta_url = character(),
+  status = character(),
+  file_name = character()
+)
+
+# Main execution
+for (proteome_id in proteome_ids) {
+  cat("\n---", proteome_id, "---\n")
+  components <- get_components(proteome_id)
+  if (is.null(components)) {
+    cat("No components found or failed to retrieve for proteome:", proteome_id, "\n")
+    summary_log <- add_row(summary_log,
+                           proteome_id = proteome_id,
+                           component_name = NA,
+                           fasta_url = NA,
+                           status = "No components found",
+                           file_name = NA)
+    next
+  }
+  for (component in components) {
+    fasta_url <- build_fasta_url(proteome_id, component)
+    cat("Downloading:", component, "\n", fasta_url, "\n")
+
+    # Sanitize filename
+    file_name <- paste0(
+      proteome_id, "_", 
+      gsub("[^A-Za-z0-9_]", "_", component), 
+      ".fasta"
+    )
+    file_path <- file.path(output_dir, file_name)
+
+    success <- download_fasta_file(fasta_url, file_path)
+    if (success) {
+      status <- "Success"
+      cat("Saved to:", file_path, "\n\n")
+    } else {
+      status <- "Failed"
+      file_name <- NA
+      cat("Failed to download:", fasta_url, "\n\n")
+    }
+
+    summary_log <- add_row(summary_log,
+                           proteome_id = proteome_id,
+                           component_name = component,
+                           fasta_url = fasta_url,
+                           status = status,
+                           file_name = file_name)
+
+    Sys.sleep(0.2)  # Politeness delay
+  }
+}
+
+# Write summary report to CSV
+write_csv(summary_log, summary_file)
+cat("Download summary saved to:", summary_file, "\n")
+```
+
+## Analyse the summary file 
+9 files failed to download (no proteins)
+
+```{r}
+summary_log<- read_csv(here("uniprot_component_fasta_files", "download_summary.csv"))  
+summary_log |> count(status)
+summary_log |> filter(status =="Failed") # 9 failed
+#UP000075229 Plasmid unnamed 14 -  no proteins
+#UP001317516 all six entries failed. This is Candidatus Borrelia fainii. The proteins are not annotated (in uniparc)
+#UP000515603 Plasmid p37AFGy1 - no proteins
+#UP000515603 Plasmid p39AFGy1 - no proteins
+```
+## Part 2
+Identify potential beta barrels in Borrelia proteome
+
+# Generate list of protein targets from component fasta files.
+-   read all fasta files in folder "uniprot_component_fasta_files"
+-   generate a dataframe with all protein targets (protein_id) and the corresponding component (chromosome or plasmid name).
+-   tidy up
+
+```{r}
+# Set input directory
+input_dir <- here("uniprot_component_fasta_files")
+
+# List all FASTA files in the input directory
+fasta_files <- list.files(input_dir, pattern = "\\.(fa|fasta)$", full.names = TRUE)
+
+# Initialize an empty list to store data
+seq_data_list <- list()
+
+# Read and extract data from each file
+for (f in fasta_files) {
+  #cat("Reading:", f, "\n")
+  seqs <- readAAStringSet(f)
+  df <- tibble(
+    name = names(seqs),
+    sequence = as.character(seqs),
+    filename = basename(f) #removes the path
+  )
+  seq_data_list[[f]] <- df
+}
+
+# Combine into a single dataframe and tidy up
+protein_targets <- bind_rows(seq_data_list)
+rm(df, seq_data_list, seqs, f, fasta_files, input_dir)
+
+# Extract information from fasta header (name)
+protein_targets<-protein_targets |> 
+  separate("name", into = c("stuff1", "protein_id", "rest"), sep = "\\|", extra= "merge") |> 
+  separate("rest", into = c("protein_species", "rest2"), extra= "merge", sep = " ")  |> 
+  separate("rest2", into = c("annotation", "rest3"), extra= "merge", sep = " OS=") |> 
+   separate("rest3", into = c("subspecies", "ncbi_taxonomy_and_rest"), extra= "merge", sep = " OX=") |> 
+  separate("ncbi_taxonomy_and_rest", into = c("ncbi_taxonomy", "gene_and_rest"), extra= "merge", sep = " GN=") |> 
+  separate("gene_and_rest", into = c("gene", "protein_existence_and_version"), extra= "merge", sep = " ") 
+
+#Some basic checks
+protein_targets |> summarise(n_distinct(ncbi_taxonomy)) #23
+protein_targets |> summarise(n_distinct(subspecies)) #23
+protein_targets |> summarise(n_distinct(protein_id)) #30443
+protein_targets <- protein_targets |> distinct(protein_id, .keep_all = TRUE)
+
+# Extract information from filename (chromosome or plasmid)
+# How many proteins are on plasmids vs chromosomes
+
+protein_targets <- protein_targets |> 
+  separate("filename", into = c("proteome_id", "component"), extra= "merge", sep = "_") |> 
+  mutate(component = str_remove(component, "\\.fasta$"))
+protein_targets |> count(component, sort = TRUE) #many are unassembled.
+protein_targets |> filter(component == "Unassembled_WGS_sequence" ) |> count(proteome_id) #4 proteomes are unassembled. All these proteins will be removed later
+```
+## Import all results
+
+# PRED-TMBB2
+
+```{r}
+# Importing results from PRED_TMBB2
+results_pred_tmbb2 <- read_tsv(here("results","predtmbb2_results.txt"), col_names = TRUE) |> 
+  clean_names() |>  
+	separate("protein_id", into = c("stuff1", "protein_id", "protein_abbrev", "species_id", "rest"), sep = "_") |> 
+	separate(beta_barrel_score_cut_off_0_25, into = c("X4", "prediction_predtmbb2"), sep = "\\|") |> 
+	select(protein_id, species_id, prediction_predtmbb2, sequence_length) |>  
+	distinct()
+
+results_pred_tmbb2 |> count(is.na(protein_id))
+results_pred_tmbb2 |> count(is.na(prediction_predtmbb2))
+results_pred_tmbb2 |> filter(is.na(protein_id))
+```
+
+# Import SignalP results
+
+```{r}
+# read signalp results
+results_signalp6 <- read_tsv(
+      here("results",  "signalp_results.txt"),
+      skip = 1,
+      col_names = TRUE,
+      name_repair = "universal") |>
+      clean_names() |>
+      separate("id", into = c("stuff1", "protein_id", "rest"), sep = "\\|", extra = "merge") |>
+      select(protein_id, prediction) |>
+      dplyr::rename(prediction_signalp = prediction) |>
+      distinct(protein_id, .keep_all = TRUE)
+results_signalp6 |> count(prediction_signalp, sort=TRUE)
+```
+
+# Importing results from PSORTb
+
+```{r}
+results_psortb <- read_tsv(here("results","PSORTb_results.txt"))
+# clean the data
+results_psortb <- results_psortb |> 	
+  separate(seq_id, into = c("stuff1", "protein_id", "rest"), sep = "\\|") |>  
+	separate(rest, into = c("protein_abbrev", "rest"), sep = "_", extra = "merge") |>  
+	separate(rest, into = c("species_id", "protein_description"), sep = " ", extra = "merge") |>  
+	distinct() |> 
+	select(protein_id, species_id, localization) |>  
+	dplyr::rename("prediction_psortb" = localization  )
+results_psortb |>  distinct() |>   group_by(prediction_psortb) |>  count() |>  arrange(desc(n)) 
+
+```
+
+# Importing results from TMHMM 
+```{r}
+results_tmhmm <- read_csv(here("results", "tmhmm_results.txt"),col_names = FALSE)
+
+# separate the column X1 to get the protein id and the prediction
+results_tmhmm <- results_tmhmm |>  separate("X1", into = c("stuff1", "protein_id", "rest"), sep = "\\|", extra= "merge")  
+results_tmhmm <- results_tmhmm |>  
+  mutate(prediction_tmhmm = str_trim(word(rest, -1, sep = "\\|"))) |> 
+  select(protein_id, prediction_tmhmm) |> distinct(protein_id, .keep_all = TRUE)
+results_tmhmm |> count(prediction_tmhmm)
+```
+
+## Combine all results with the list of protein_targets
+```{r}
+all_results <- 
+	purrr::reduce(.x = list(protein_targets, results_psortb, results_pred_tmbb2, results_signalp6, results_tmhmm), .f = left_join, by = "protein_id") |> 
+  mutate(prediction_predtmbb2 = as.numeric(prediction_predtmbb2))
+all_results |> distinct() |>  count() #30443
+```
+
+## Some analysis, filtering
+check that nothing is missing
+
+```{r}
+all_results |> count(is.na(prediction_predtmbb2))
+all_results |> count(is.na(prediction_psortb))
+all_results |> count(is.na(prediction_psortb))
+all_results |> count(is.na(prediction_tmhmm)) 
+```
+
+## The Great Filter
+
+Search for plasmid-encoded beta barrels. This reveals 4 hits (one is a fragment)
+
+```{r}
+# The big filtering
+filtered_prediction <- all_results |>  
+  filter(component != "Unassembled_WGS_sequence") |>  #remove the unassembled proteomes
+  filter(component != "Chromosome") |> #remove chromosomal sequences
+  filter(!prediction_psortb %in% c("Cytoplasmic", "CytoplasmicMembrane")) |>  #not cytoplasmic
+  filter(prediction_signalp =="SP") |>  # has a signal peptide, not a lipoprotein
+	filter(prediction_predtmbb2 > 0.25) |>    #is predicted to be a beta barrel
+  filter(prediction_tmhmm == "BETA")  
+  #filter(annotation != "DUF5723 domain-containing protein (Fragment)") #removes the fragment 
+filtered_prediction
+```
+
