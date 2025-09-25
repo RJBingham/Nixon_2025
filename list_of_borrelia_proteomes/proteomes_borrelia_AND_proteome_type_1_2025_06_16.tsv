@@ -1,0 +1,4 @@
+Proteome Id	Organism	Organism Id	Protein count	BUSCO	CPD
+UP000019148	Borrelia duttonii CR2A	1432657	1995	C:78.3%[S:73.3%,D:4.9%],F:13.0%,M:8.7%,n:345	Unknown
+UP000001205	Borrelia turicatae (strain 91E135)	314724	115	C:99.7%[S:99.7%,D:0.0%],F:0.0%,M:0.3%,n:345	Unknown
+UP000001807	Borreliella burgdorferi (strain ATCC 35210 / DSM 4680 / CIP 102532 / B31) (Borrelia burgdorferi)	224326	1291	C:93.3%[S:93.3%,D:0.0%],F:0.0%,M:6.7%,n:345	Unknown
